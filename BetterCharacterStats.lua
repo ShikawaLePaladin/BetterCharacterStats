@@ -19,8 +19,10 @@ BCS.PLAYERSTAT_DROPDOWN_OPTIONS = {
 	"PLAYERSTAT_BASE_STATS",
 	"PLAYERSTAT_MELEE_COMBAT",
 	"PLAYERSTAT_MELEE_BOSS",
+	"PLAYERSTAT_MELEE_BOSS2",
 	"PLAYERSTAT_RANGED_COMBAT",
 	"PLAYERSTAT_SPELL_COMBAT",
+	"PLAYERSTAT_SPELL_BOSS",
 	"PLAYERSTAT_SPELL_SCHOOLS",
 	"PLAYERSTAT_DEFENSES",
 	"PLAYERSTAT_DEFENSES_BOSS",
@@ -497,7 +499,33 @@ function BCS:SetArmor(statFrame)
 	AddTooltip(statFrame)
 end
 
+-- ===================================================================
+-- Formules de combat. Par defaut : celles du SERVEUR (BCS_Rules.lua, tirees du code du serveur). "/bcsrules vanilla" remet les formules du
+-- Vanilla d'origine (autres serveurs). Avant 2026-10 BCS choisissait selon TURTLE_WOW_VERSION, variable que ce client ne definit pas.
+-- ===================================================================
+local BOSS_LEVEL = 63
+
+function BCS:UseServerRules()
+	return BCSConfig.rules ~= "vanilla"
+end
+
+function BCS:PlayerMaxSkill()
+	return UnitLevel("player") * 5 -- 300 au niveau 60
+end
+
+function BCS:BossDefense()
+	return BOSS_LEVEL * 5 -- 315
+end
+
+local function IsWandUser()
+	return playerClass == "PRIEST" or playerClass == "MAGE" or playerClass == "WARLOCK"
+end
+
 function BCS:GetMissChanceRaw(wepSkill)
+	if BCS:UseServerRules() then
+		-- 5 % - 0,2 % par point (competence - 315) - toucher ; pas de borne ici (les appelants bornent)
+		return 5 - 0.2 * (wepSkill - BCS:BossDefense()) - BCS:GetHitRating()
+	end
 	local diff = wepSkill - 315
 	local miss = 5
 
@@ -528,11 +556,22 @@ function BCS:GetDualWieldMissChance(wepSkill)
 	return max(0, min(BCS:GetMissChanceRaw(wepSkill) + 19, 60))
 end
 
+-- toucher qu'il faut AU TOTAL pour ne plus rater un boss 63 (attaque blanche ; deux armes : +19 %)
+function BCS:GetHitNeeded(wepSkill, dual)
+	return BCS.Rules.HitNeeded(wepSkill, dual, BCS:BossDefense())
+end
+
 function BCS:GetGlanceChance(wepSkill)
+	if BCS:UseServerRules() then
+		return BCS.Rules.GlanceChance(wepSkill, BCS:BossDefense(), BCS:PlayerMaxSkill())
+	end
 	return 10 + 15 * 2;
 end
 
 function BCS:GetGlanceReduction(wepSkill)
+	if BCS:UseServerRules() then
+		return BCS.Rules.GlanceDamage(wepSkill, BCS:BossDefense(), BCS:PlayerMaxSkill(), IsWandUser())
+	end
 	if TURTLE_WOW_VERSION ~= nil then
 		return 65 + (wepSkill - 300) * 2
 	else
@@ -545,6 +584,23 @@ end
 
 function BCS:GetDodgeChance(wepSkill)
 	return math.max(5 + (315 - wepSkill) * 0.1, 0);
+end
+
+-- parade / blocage d'un boss : de FACE seulement (le serveur ne les tire pas dans le dos)
+function BCS:GetBossParryChance(wepSkill)
+	return BCS.Rules.Parry(wepSkill, BCS:BossDefense(), BCS:PlayerMaxSkill())
+end
+
+function BCS:GetBossBlockChance(wepSkill)
+	return BCS.Rules.Block(wepSkill, BCS:BossDefense())
+end
+
+-- modificateur de critique contre un boss 63 : -3 % jusqu'a 315 de competence, puis +0,04 % par point (la suppression disparait)
+function BCS:GetBossCritModifier(wepSkill)
+	if BCS:UseServerRules() then
+		return BCS.Rules.CritMod(wepSkill, BCS:BossDefense(), BCS:PlayerMaxSkill())
+	end
+	return -3
 end
 
 function BCS:GetDualWieldCritCap(wepSkill)
@@ -569,6 +625,16 @@ function BCS:GetCritCap(wepSkill)
 	return cap;
 end
 
+-- plafond de critique de FACE (parade et blocage s'ajoutent a la table d'attaque)
+function BCS:GetCritCapFront(wepSkill, dual)
+	local miss = dual and self:GetDualWieldMissChance(wepSkill) or self:GetMissChance(wepSkill)
+	return BCS.Rules.CritCapFront(miss, self:GetDodgeChance(wepSkill), self:GetBossParryChance(wepSkill), self:GetGlanceChance(wepSkill), self:GetBossBlockChance(wepSkill))
+end
+
+-- sorts : base de toucher contre un boss 63 (niveau du lanceur : le tien)
+function BCS:GetSpellBaseHitVsBoss()
+	return BCS.Rules.SpellBaseHit(BOSS_LEVEL - UnitLevel("player"), false)
+end
 function BCS:GetEffectiveBlockChance(leveldiff)
 	local block = GetBlockChance() - ((5 * leveldiff) * 0.04)
 	if block < 0 then
@@ -883,14 +949,16 @@ function BCS:SetEffectiveBossCrit(statFrame)
 	local label = getglobal(statFrame:GetName() .. "Label")
 	label:SetText(L.BOSS_CRIT_COLON)
 
-	local critChance = BCS:GetCritChance() - 3 -- 3 % crit reduction vs lvl 63
+	-- modificateur reel du serveur (depend de la competence : -3 % jusqu'a 315, puis +0,04 % par point) ; jamais negatif
+	local critMH = math.max(0, BCS:GetCritChance() + BCS:GetBossCritModifier(BCS:GetMHWeaponSkill()))
 	if OffhandHasWeapon() == 1 then
+		local critOH = math.max(0, BCS:GetCritChance() + BCS:GetBossCritModifier(BCS:GetOHWeaponSkill()))
 		text:SetText(format("%.1f%% | %.1f%%",
-				math.min(critChance, BCS:GetDualWieldCritCap(BCS:GetMHWeaponSkill())),
-				math.min(critChance, BCS:GetDualWieldCritCap(BCS:GetOHWeaponSkill()))
+				math.min(critMH, BCS:GetDualWieldCritCap(BCS:GetMHWeaponSkill())),
+				math.min(critOH, BCS:GetDualWieldCritCap(BCS:GetOHWeaponSkill()))
 		))
 	else
-		text:SetText(format("%.1f%%", math.min(critChance, BCS:GetCritCap(BCS:GetMHWeaponSkill()))))
+		text:SetText(format("%.1f%%", math.min(critMH, BCS:GetCritCap(BCS:GetMHWeaponSkill()))))
 	end
 
 	statFrame.tooltip = format(L.MELEE_EFF_CRIT_VS_BOSS_TOOLTIP)
@@ -1307,6 +1375,149 @@ function BCS:SetRangedAttackPower(statFrame)
 	AddTooltip(statFrame)
 end
 
+-- ===================================================================
+-- Panneaux "vs Boss" supplementaires (formules du serveur)
+-- ===================================================================
+local function SkillPair(fmt, fn)
+	if OffhandHasWeapon() == 1 then
+		return format(fmt .. " | " .. fmt, fn(BCS:GetMHWeaponSkill()), fn(BCS:GetOHWeaponSkill()))
+	end
+	return format(fmt, fn(BCS:GetMHWeaponSkill()))
+end
+
+-- toucher actuel / toucher necessaire pour ne plus rater un boss 63 (attaque blanche)
+function BCS:SetHitNeeded(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.HIT_NEEDED_COLON)
+	local hit = BCS:GetHitRating()
+	local dual = OffhandHasWeapon() == 1
+	local need = BCS:GetHitNeeded(BCS:GetMHWeaponSkill(), dual)
+	local color = (hit >= need) and GREEN_FONT_COLOR_CODE or ""
+	text:SetText(format("%s%.1f%%|r / %.1f%%", color, hit, need))
+	statFrame.tooltip = L.HIT_NEEDED_TOOLTIP
+	statFrame.tooltipSubtext = format(L.HIT_NEEDED_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+-- idem pour les attaques speciales (pas de malus des deux armes)
+function BCS:SetHitNeededSpecial(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.HIT_NEEDED_SPECIAL_COLON)
+	local hit = BCS:GetHitRating()
+	local need = BCS:GetHitNeeded(BCS:GetMHWeaponSkill(), false)
+	local color = (hit >= need) and GREEN_FONT_COLOR_CODE or ""
+	text:SetText(format("%s%.1f%%|r / %.1f%%", color, hit, need))
+	statFrame.tooltip = L.HIT_NEEDED_SPECIAL_TOOLTIP
+	statFrame.tooltipSubtext = format(L.HIT_NEEDED_SPECIAL_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+function BCS:SetBossParryChance(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.BOSS_PARRY_COLON)
+	text:SetText(SkillPair("%.1f%%", function(s) return BCS:GetBossParryChance(s) end))
+	statFrame.tooltip = L.BOSS_PARRY_TOOLTIP
+	statFrame.tooltipSubtext = format(L.BOSS_PARRY_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+function BCS:SetBossBlockChance(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.BOSS_BLOCK_COLON)
+	text:SetText(SkillPair("%.1f%%", function(s) return BCS:GetBossBlockChance(s) end))
+	statFrame.tooltip = L.BOSS_BLOCK_TOOLTIP
+	statFrame.tooltipSubtext = format(L.BOSS_BLOCK_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+function BCS:SetBossCritModifier(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.BOSS_CRIT_MOD_COLON)
+	text:SetText(SkillPair("%+.2f%%", function(s) return BCS:GetBossCritModifier(s) end))
+	statFrame.tooltip = L.BOSS_CRIT_MOD_TOOLTIP
+	statFrame.tooltipSubtext = format(L.BOSS_CRIT_MOD_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+function BCS:SetCritCapFront(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.CRIT_CAP_FRONT_COLON)
+	local dual = OffhandHasWeapon() == 1
+	if dual then
+		text:SetText(format("%.1f%% | %.1f%%", BCS:GetCritCapFront(BCS:GetMHWeaponSkill(), true), BCS:GetCritCapFront(BCS:GetOHWeaponSkill(), true)))
+	else
+		text:SetText(format("%.1f%%", BCS:GetCritCapFront(BCS:GetMHWeaponSkill(), false)))
+	end
+	statFrame.tooltip = L.CRIT_CAP_FRONT_TOOLTIP
+	statFrame.tooltipSubtext = format(L.CRIT_CAP_FRONT_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+-- sorts contre un boss 63
+function BCS:SetSpellHitTotal(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.SPELL_HIT_RATING_COLON)
+	text:SetText(format("%.1f%%", (BCS:GetSpellHitRating())))
+	statFrame.tooltip = L.SPELL_HIT_TOOLTIP
+	statFrame.tooltipSubtext = L.SPELL_HIT_TOOLTIP_SUB
+	AddTooltip(statFrame)
+end
+
+function BCS:SetSpellHitVsBoss(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.SPELL_HIT_VS_BOSS_COLON)
+	local hit = BCS:GetSpellHitRating()
+	local chance = BCS.Rules.SpellHit(BCS:GetSpellBaseHitVsBoss(), hit)
+	text:SetText(format("%.1f%%", chance))
+	statFrame.tooltip = L.SPELL_HIT_VS_BOSS_TOOLTIP
+	statFrame.tooltipSubtext = format(L.SPELL_HIT_VS_BOSS_TOOLTIP_SUB, BCS:GetSpellBaseHitVsBoss())
+	AddTooltip(statFrame)
+end
+
+function BCS:SetSpellHitNeeded(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.SPELL_HIT_NEEDED_COLON)
+	local hit = BCS:GetSpellHitRating()
+	local need = BCS.Rules.SpellHitNeeded(BCS:GetSpellBaseHitVsBoss())
+	if hit >= need then
+		text:SetText(GREEN_FONT_COLOR_CODE .. L.CAPPED .. "|r")
+	else
+		text:SetText(format("%.1f%%", need - hit))
+	end
+	statFrame.tooltip = L.SPELL_HIT_NEEDED_TOOLTIP
+	statFrame.tooltipSubtext = format(L.SPELL_HIT_NEEDED_TOOLTIP_SUB, need)
+	AddTooltip(statFrame)
+end
+
+-- critique des sorts : le serveur n'applique AUCUNE suppression de niveau aux sorts magiques
+function BCS:SetSpellCritVsBoss(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.SPELL_CRIT_VS_BOSS_COLON)
+	text:SetText(format("%.2f%%", BCS:GetSpellCritChance()))
+	statFrame.tooltip = L.SPELL_CRIT_VS_BOSS_TOOLTIP
+	statFrame.tooltipSubtext = format(L.SPELL_CRIT_VS_BOSS_TOOLTIP_SUB)
+	AddTooltip(statFrame)
+end
+
+function BCS:SetSpellPenetration(statFrame)
+	local text = getglobal(statFrame:GetName() .. "StatText")
+	local label = getglobal(statFrame:GetName() .. "Label")
+	label:SetText(L.SPELL_PEN_COLON)
+	text:SetText(format("%d", BCS:GetSpellPen()))
+	statFrame.tooltip = L.SPELL_PEN_TOOLTIP
+	statFrame.tooltipSubtext = L.SPELL_PEN_TOOLTIP_SUB
+	AddTooltip(statFrame)
+end
 function BCS:UpdatePaperdollStats(prefix, index)
 	for i = 1, 6 do
 		local frame = _G[prefix .. i]
@@ -1343,6 +1554,20 @@ function BCS:UpdatePaperdollStats(prefix, index)
 		BCS:SetBossGlanceReduction(stat4)
 		BCS:SetBossCritCap(stat5)
 		BCS:SetEffectiveBossCrit(stat6)
+	elseif (index == "PLAYERSTAT_MELEE_BOSS2") then
+		BCS:SetHitNeeded(stat1)
+		BCS:SetHitNeededSpecial(stat2)
+		BCS:SetBossParryChance(stat3)
+		BCS:SetBossBlockChance(stat4)
+		BCS:SetBossCritModifier(stat5)
+		BCS:SetCritCapFront(stat6)
+	elseif (index == "PLAYERSTAT_SPELL_BOSS") then
+		BCS:SetSpellHitTotal(stat1)
+		BCS:SetSpellHitVsBoss(stat2)
+		BCS:SetSpellHitNeeded(stat3)
+		BCS:SetSpellCritVsBoss(stat4)
+		BCS:SetSpellPenetration(stat5)
+		BCS:SetSpellHaste(stat6)
 	elseif (index == "PLAYERSTAT_RANGED_COMBAT") then
 		BCS:SetRangedWeaponSkill(stat1)
 		BCS:SetRangedDamage(stat2)
@@ -1462,4 +1687,20 @@ function PlayerStatFrameRightDropDown_OnLoad()
 	UIDropDownMenu_Initialize(this, PlayerStatFrameRightDropDown_Initialize)
 	UIDropDownMenu_SetWidth(99, this)
 	UIDropDownMenu_JustifyText("LEFT")
+end
+
+-- /bcsrules server|vanilla : formules du serveur (defaut) ou du Vanilla d'origine
+SLASH_BCSRULES1 = "/bcsrules"
+SlashCmdList["BCSRULES"] = function(msg)
+	msg = string.lower(msg or "")
+	if msg == "server" or msg == "serveur" then
+		BCSConfig.rules = "server"
+	elseif msg == "vanilla" then
+		BCSConfig.rules = "vanilla"
+	end
+	BCS:Print("formules de combat : " .. (BCS:UseServerRules() and "SERVEUR (OctoWoW)" or "Vanilla d'origine") .. "  (/bcsrules server | vanilla)")
+	BCS.needScanGear = true
+	if PaperDollFrame and PaperDollFrame:IsVisible() then
+		BCS:UpdateStats()
+	end
 end
